@@ -1,0 +1,16 @@
+flowchart TD
+    A[Start] --> B[Generate random plaintexts]
+    B --> C[Encrypt plaintexts with Random Target Key]
+    C --> D[Construct Hamiltonians from ciphertexts]
+    D --> E[Build Gaussian Prior centered on Target Key]
+    E --> F[Pretrain Ansatz to match Prior using KL Divergence Minimization]
+    F --> G[Initialize Ansatz Parameters with Pretrained Values]
+    G --> H[Measure Cost Function Expectation Value]
+    H --> I[Compute Gradient using Parameter-Shift Rule]
+    I --> J[Update Parameters using Gradient Descent or Adam]
+    J --> K{Cost < Threshold or Max Iterations?}
+    K -- No --> H
+    K -- Yes --> L[Sample Key Candidates from Trained Ansatz]
+    L --> M[Perform Majority Voting over Sampled Keys]
+    M --> N[Return Key with Maximum Votes as Guessed Key]
+    N --> O[End]
