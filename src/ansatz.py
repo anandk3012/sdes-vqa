@@ -147,7 +147,7 @@ def create_2local_ansatz(num_qubits: int = 10, reps: int = 3):
         rotation_blocks=['ry', 'rz'],
         entanglement_blocks='cz',
         entanglement='linear',
-        reps=1,
+        reps=reps,
         insert_barriers=True
     )
     return qc

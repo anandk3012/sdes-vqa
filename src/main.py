@@ -1,6 +1,8 @@
 import json
 import numpy as np
-import os 
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from collections import Counter
 from src.sdes import sdes_encrypt
 from src.prior import gaussian_prior
@@ -28,8 +30,7 @@ def main():
         plaintexts = pairs["plaintexts"]
         ciphertexts = pairs["ciphertexts"]
     else:
-        # true_key = random_10bit_string()
-        true_key = "1011010101"
+        true_key = random_10bit_string()
         plaintexts = [random_8bit_string() for _ in range(config.NUM_PLAINTEXTS)]
         ciphertexts = [sdes_encrypt(pt, true_key) for pt in plaintexts]
 
