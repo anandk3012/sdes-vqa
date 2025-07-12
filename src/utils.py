@@ -1,10 +1,10 @@
 import numpy as np
 from collections import Counter
-from src.sdes import sdes_encrypt
+from src.sdes import sdes_encrypt, s_aes_encrypt
 
 from qiskit_aer import AerSimulator
 from qiskit.quantum_info import SparsePauliOp, Statevector
-from qiskit.primitives import BackendEstimatorV2 as Estimator
+from qiskit_ibm_runtime import EstimatorV2 as Estimator, ibm_backend
 from qiskit import QuantumCircuit
 
 def to_jsonable(obj):
@@ -79,6 +79,10 @@ def random_10bit_string() -> str:
     """Return a random 10-bit string."""
     return random_bitstring(10)
 
+def random_16bit_string() -> str:
+    """Return a random 16-bit string."""
+    return random_bitstring(16)
+
 def random_8bit_string() -> str:
     """Return a random 8-bit string."""
     return random_bitstring(8)
@@ -98,7 +102,10 @@ def encrypt_counts_keys(counts: dict, plaintext: str) -> Counter:
     """
     result = Counter()
     for key_str, freq in counts.items():
-        cipher = sdes_encrypt(plaintext, key_str)
+        if(len(key_str) == 10):
+            cipher = sdes_encrypt(plaintext, key_str)
+        elif (len(key_str) == 16):
+            cipher = s_aes_encrypt(plaintext, key_str[:10])
         result[cipher] += freq
     return result
 
@@ -122,7 +129,7 @@ def expectation_from_probabilities(probs: dict, hamiltonian: SparsePauliOp) -> f
     
     return exp_val
 
-def expectation_from_estimator(hamiltonian: SparsePauliOp, qc: QuantumCircuit, shots: int = 1024) -> Estimator:
+def expectation_from_estimator(hamiltonian: SparsePauliOp, qc: QuantumCircuit, params, backend : ibm_backend.IBMBackend = None ,shots: int = 1024) -> Estimator:
     """
     Estimate the expectation value of a Hamiltonian using a quantum circuit.
     Args:
@@ -133,8 +140,10 @@ def expectation_from_estimator(hamiltonian: SparsePauliOp, qc: QuantumCircuit, s
     Returns:
         Scalar expectation value ⟨H⟩.
     """
-    estimator = Estimator(backend=AerSimulator())
-    job = estimator.run([(qc, hamiltonian)])
+    if backend is None:
+        backend = AerSimulator()
+    estimator = Estimator(mode=backend)
+    job = estimator.run([(qc, hamiltonian, params)])
     result = job.result()
     exp_value = float(result[0].data.evs)
     print(exp_value)

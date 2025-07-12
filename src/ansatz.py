@@ -80,7 +80,7 @@ def create_improved_ansatz(num_qubits: int = 10, reps: int = 5):
     θ = ParameterVector('θ', num_qubits * reps)
     φ = ParameterVector('φ', num_qubits * reps)
     λ = ParameterVector('λ', num_qubits * reps)
-    qc = QuantumCircuit(num_qubits)
+    qc = QuantumCircuit(num_qubits, num_qubits)
 
     # Initial Hadamards
     qc.h(range(num_qubits))

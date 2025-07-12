@@ -5,7 +5,8 @@ from tqdm import tqdm, trange
 
 from qiskit import QuantumCircuit, transpile
 from qiskit.quantum_info import Statevector, SparsePauliOp
-from qiskit_ibm_runtime import Sampler
+from qiskit_ibm_runtime import Sampler, QiskitRuntimeService, ibm_backend, Estimator
+
 from qiskit_aer import AerSimulator
 from qiskit_finance.circuit.library import NormalDistribution
 from hamming_gaussian import HammingGaussianDistribution
@@ -14,42 +15,9 @@ from src.prior import hamming_distance
 from src.ansatz import create_improved_ansatz
 from src.utils import encrypt_counts_keys, expectation_from_probabilities, expectation_from_estimator
 from src.hamiltonian import build_hamiltonian
+import time
 
-
-def get_probabilities_statevector(
-    qc: QuantumCircuit,
-    param_list: list,
-    numeric_params: np.ndarray
-) -> np.ndarray:
-    """
-    Bind numeric_params to param_list in qc, simulate statevector,
-    and return a length-(2^n) array of probabilities.
-    """
-    bound_qc = qc.assign_parameters(
-        {p: v for p, v in zip(param_list, numeric_params)},
-        inplace=False
-    )
-    sv = Statevector.from_instruction(bound_qc)
-    return sv.probabilities()
-
-# Loss functions
-
-def kl_divergence_loss(
-    numeric_params: np.ndarray,
-    prior_probs: np.ndarray,
-    qc: QuantumCircuit,
-    param_list: list
-) -> float:
-    """
-    Compute KL(prior || ansatz_output) = sum_i prior[i] * log(prior[i]/q[i]),
-    where q is the distribution produced by the ansatz statevector.
-    """
-    q_probs = get_probabilities_statevector(qc, param_list, numeric_params)
-    eps = 1e-10
-    q_probs = np.clip(q_probs, eps, 1.0)
-    prior_clipped = np.clip(prior_probs, eps, 1.0)
-    return float(np.sum(prior_clipped * np.log(prior_clipped / q_probs)))
-
+# Pretrain Loss function
 def fidelity_loss(
     numeric_params: np.ndarray,
     target_sv: np.ndarray,
@@ -66,68 +34,122 @@ def fidelity_loss(
     fidelity = np.abs(np.vdot(target_sv, sv_ansatz))**2
     return 1 - fidelity
 
-
-# Pre training params
-
-def pretrain_ansatz(
+def sample_based_fidelity_loss(
+    backend: ibm_backend.IBMBackend,
+    target_probs: dict,
     qc: QuantumCircuit,
     param_list: list,
-    prior_probs: np.ndarray,
-    maxiter: int = 300,
-    random_seed: int = 42
-) -> np.ndarray:
-    """
-    Run L-BFGS-B to minimize KL divergence between a Gaussian prior and ansatz output.
-    Shows a tqdm bar for each L-BFGS-B iteration (up to maxiter).
+    params: np.ndarray,
+    shots: int = 2048
+) -> float:
+    # Assign parameters
+    binding = {p: v for p, v in zip(param_list, params)}
+    # Add measurement (only needed for sampling)
+    n = qc.num_qubits
+    measured_qc = qc.copy()
+    measured_qc.measure_all()
+    transpiled_qc = transpile(measured_qc, backend=backend, optimization_level=3)
 
-    Returns:
-        The optimized flat parameter array (numpy.ndarray).
-    """
-    np.random.seed(random_seed)
-    init_params = np.random.uniform(0, 2 * np.pi, len(param_list))
+    # Run sampler
+    sampler = Sampler(mode=backend)
+    job = sampler.run([(transpiled_qc, binding)], shots=shots)
+    result = job.result()._pub_results[0].data.c
+    sampled_counts = result.get_counts()
+      # key = int, value = prob
 
-    # Create a tqdm progress bar for L-BFGS-B iterations
-    pbar = tqdm(total=maxiter, desc="Pretrain KL Loss", leave=True)
+    # Convert target_probs (numpy array) to dict over int keys
+    eps = 1e-9
+    target_probs_clipped = np.clip(list(target_probs.values()), eps, 1)
+    sampled_probs_clipped = np.array([sampled_counts.get(i, 0) for i in range(2**n)])
+    sampled_probs_clipped = np.clip(sampled_probs_clipped, eps, 1)
 
-    history = []
-    
-    def objective(params):
-        kl = kl_divergence_loss(params, prior_probs, qc, param_list)
-        history.append(kl)
-        
-        return kl
-    
-    
-    def callback(params):
-        # Each time the optimizer calls back, advance the bar by 1
-        pbar.update(1)
-        
-    kl_init = kl_divergence_loss(init_params, prior_probs, qc, param_list)
+    # Compute classical fidelity: F = (sum sqrt(p_i q_i))^2
+    overlap = np.sum(np.sqrt(target_probs_clipped * sampled_probs_clipped))
+    fidelity = overlap ** 2
+    return 1 - fidelity
 
-    res = minimize(
-        objective,
-        init_params,
-        method="L-BFGS-B",
-        options={"maxiter": maxiter, "disp": False},
-        callback=callback
-    )
-    pbar.close()
-    
-    with open("kl_history.txt", "w") as f:
-        f.write(str(np.array(history)))
-    
-    kl_final = kl_divergence_loss(res.x, prior_probs, qc, param_list)
-    print(f"Initial KL: {kl_init:.6f}, Final KL: {kl_final:.6f}")
-    
-    return res.x  # optimized parameter vector
-
-def pretrain_ansatz_with_fidelity(
+# Pre training params
+def saes_pretrain_ansatz_with_fidelity(
     mean_bitstring: str,
     num_qubits: int = 10,
     sigma: float = 2.5,
     reps: int = 5,
     maxiter: int = 300,
-    random_seed: int = 42
+    random_seed: int = 42,
+    optimizer: str = "COBYLA",
+    backend : ibm_backend.IBMBackend = None,
+    shots: int = 2048
+):
+    print(f"Std_dev for Gaussian prior: {sigma}")
+    np.random.seed(random_seed)
+    mu = int(mean_bitstring, 2)
+    bounds = (0, 2**num_qubits - 1)
+
+    # sv_init_time = time.time()
+    # hamming_init = NormalDistribution(num_qubits=num_qubits, mu=mu, sigma=sigma, bounds=bounds)
+    # target_probs = Statevector.from_instruction(hamming_init.decompose()).probabilities_dict()
+    # sv_init_end_time = time.time()
+    # sv_init_elapsed_time = sv_init_end_time - sv_init_time
+    # print(f"Statevector initialization took {sv_init_elapsed_time:.2f} seconds.")
+    ansatz, θ_list, φ_list, λ_list = create_improved_ansatz(num_qubits, reps)
+    param_list = θ_list + φ_list + λ_list
+    init_params = np.random.uniform(0, 2 * np.pi, len(param_list))
+    return init_params, []
+    # assert len(param_list) == len(init_params), "Mismatch between circuit parameters and initial parameter values!"
+    
+    # loss_history = []
+    # pbar = tqdm(total=maxiter, desc="Pretraining Fidelity Loss")
+
+    # if num_qubits <= 10:
+    #     # Use statevector fidelity
+    #     def loss_fn(params):
+    #         sv_ansatz = Statevector.from_instruction(
+    #             ansatz.assign_parameters({p: v for p, v in zip(param_list, params)})
+    #         ).data
+    #         sv_target = Statevector.from_instruction(hamming_init.decompose()).data
+    #         fidelity = np.abs(np.vdot(sv_target, sv_ansatz))**2
+    #         loss = 1 - fidelity
+    #         loss_history.append(loss)
+    #         return loss
+
+    # else:
+    #     def loss_fn(params):
+    #         loss = sample_based_fidelity_loss(backend, target_probs, ansatz, param_list, params, shots=shots)
+    #         loss_history.append(loss)
+    #         return loss
+
+    # def callback(params):
+    #     pbar.update(1)
+
+    # initial_loss = loss_fn(init_params)
+    # print(f"Initial Fidelity Loss: {initial_loss:.6f}")
+
+    # result = minimize(
+    #     loss_fn,
+    #     init_params,
+    #     method=optimizer,
+    #     options={"maxiter": maxiter, "disp": False},
+    #     callback=callback
+    # )
+
+    # pbar.close()
+    # final_loss = loss_fn(result.x)
+    # print("Pretraining completed.")
+    # print(f"Initial Fidelity Loss: {initial_loss:.6f}, Final Fidelity Loss: {final_loss:.6f}")
+
+    # return result.x, loss_history
+
+
+
+# Pre training params
+def sdes_pretrain_ansatz_with_fidelity(
+    mean_bitstring: str,
+    num_qubits: int = 10,
+    sigma: float = 2.5,
+    reps: int = 5,
+    maxiter: int = 300,
+    random_seed: int = 42,
+    optimizer: str = "COBYLA"
 ):
     """
     Pre-train the ansatz parameters to maximize fidelity with a target Gaussian state.
@@ -146,23 +168,27 @@ def pretrain_ansatz_with_fidelity(
     """
     
     print("Std_dev for Gaussian prior:", sigma)
-    print("\n")
     np.random.seed(random_seed)
     mu = int(mean_bitstring, 2)
     bounds = (0, 2**num_qubits - 1)
 
     hamming_init = NormalDistribution(num_qubits=num_qubits, mu=mu, sigma=sigma, bounds=bounds)
     # hamming_init = HammingGaussianDistribution(num_qubits, mean_bitstring, sigma)
+    
     target_statevector = Statevector.from_instruction(hamming_init.decompose()).data
 
 
     ansatz, θ_list, φ_list, λ_list = create_improved_ansatz(num_qubits, reps)
     param_list = θ_list + φ_list + λ_list
-
     init_params = np.random.uniform(0, 2 * np.pi, len(param_list))
+
+    assert len(param_list) == len(init_params), "Mismatch between circuit parameters and initial parameter values!"
     pbar = tqdm(total=maxiter, desc="Pretraining Fidelity Loss")
     loss_history = []
-
+    """    Callback function to update the progress bar and record loss history.
+    This is called by the optimizer
+    after each iteration.
+    """
     def callback(params):
         if len(loss_history) < maxiter:
             loss = fidelity_loss(params, target_statevector, ansatz, param_list)
@@ -170,16 +196,16 @@ def pretrain_ansatz_with_fidelity(
             pbar.update(1)
 
     initial_loss = fidelity_loss(init_params, target_statevector, ansatz, param_list)
-
+    print(f"Initial Fidelity Loss: {initial_loss:.6f}")
     result = minimize(
         lambda params: fidelity_loss(params, target_statevector, ansatz, param_list),
         init_params,
-        method="L-BFGS-B",
+        method=optimizer,
         options={"maxiter": maxiter, "disp": False},
         callback=callback
     )
     pbar.close()
-
+    print("Pretraining completed.")
     final_loss = fidelity_loss(result.x, target_statevector, ansatz, param_list)
     print(f"Initial Fidelity Loss: {initial_loss:.6f}, Final Fidelity Loss: {final_loss:.6f}")
 
@@ -188,89 +214,16 @@ def pretrain_ansatz_with_fidelity(
 
     return result.x, loss_history
 
-def compute_gradient_statevector(
-    qc_template: QuantumCircuit,
-    flat_params: np.ndarray,
-    flat_param_list: list,
-    hamiltonian,
-    ciphertext_plaintext: str,
-    shift: float = np.pi / 2
-) -> np.ndarray:
-    """
-    Compute gradient of ⟨H⟩ w.r.t. each parameter in flat_params via parameter-shift rule,
-    using statevector simulator (exact).
-    Args:
-        qc_template: QuantumCircuit with symbolic parameters (ansatz only, no measures).
-        flat_params: numpy array of current parameter values.
-        flat_param_list: list of Parameter symbols corresponding to flat_params.
-        hamiltonian: SparsePauliOp for this ciphertext.
-        ciphertext_plaintext: the 8-bit plaintext string used for encryption in this round.
-        shift: parameter-shift amount (π/2 by default).
-    Returns:
-        grad: numpy array, same shape as flat_params.
-    """
-    num_params = len(flat_params)
-    grad = np.zeros(num_params)
 
-    for idx in range(num_params):
-        plus = flat_params.copy()
-        minus = flat_params.copy()
-        plus[idx] += shift
-        minus[idx] -= shift
-
-        # Build circuits for shifted parameters using assign_parameters:
-        qc_plus = qc_template.assign_parameters(
-            {p: v for p, v in zip(flat_param_list, plus)},
-            inplace=False
-        )
-        qc_minus = qc_template.assign_parameters(
-            {p: v for p, v in zip(flat_param_list, minus)},
-            inplace=False
-        )
-
-        # Simulate statevectors for shifted parameters
-        probs_plus = Statevector.from_instruction(qc_plus).probabilities()
-        probs_minus = Statevector.from_instruction(qc_minus).probabilities()
-
-        # Build counts-like dictionaries: key_str → prob
-        counts_plus = Counter({
-            format(i, f"0{qc_template.num_qubits}b"): p
-            for i, p in enumerate(probs_plus)
-        })
-        counts_minus = Counter({
-            format(i, f"0{qc_template.num_qubits}b"): p
-            for i, p in enumerate(probs_minus)
-        })
-
-        # Convert key-based “counts” to ciphertext-based counts
-        cipher_plus = encrypt_counts_keys(counts_plus, ciphertext_plaintext)
-        cipher_minus = encrypt_counts_keys(counts_minus, ciphertext_plaintext)
-
-        total_plus = sum(cipher_plus.values())
-        total_minus = sum(cipher_minus.values())
-
-        # Convert to probabilities over 8-bit ciphertexts
-        probs_cipher_plus = {c: freq / total_plus for c, freq in cipher_plus.items()}
-        probs_cipher_minus = {c: freq / total_minus for c, freq in cipher_minus.items()}
-
-        exp_plus = expectation_from_probabilities(probs_cipher_plus, hamiltonian)
-        exp_minus = expectation_from_probabilities(probs_cipher_minus, hamiltonian)
-
-        # Take the real part explicitly to avoid ComplexWarning
-        grad[idx] = float(np.real(exp_plus - exp_minus)) * 0.5
-
-    return grad
-
-
-
-# Circuit sims
+# Final Circuit Simulation
 def simulate_final_circuit(
     qc_template: QuantumCircuit,
     param_list: list,
     params: np.ndarray,
     ciphertext_plaintexts: list,
     rounds_key_idx: int,
-    shots: int = 1024
+    shots: int = 1024,
+    backend: ibm_backend.IBMBackend = None
 ):
     """
     Bind params to qc_template, add measurements, run a Sampler job,
@@ -296,7 +249,8 @@ def simulate_final_circuit(
     qc.measure(range(n), range(n))
 
     # Transpile and sample on backend
-    backend = AerSimulator(method='matrix_product_state')
+    if backend is None:
+        backend = AerSimulator(method='matrix_product_state')
     transpiled = transpile(qc, backend=backend)
     
     sampler = Sampler(mode=backend)
@@ -318,21 +272,43 @@ def default_objective_function(
     qc_template : QuantumCircuit,
     param_list : list,
     plaintext : str,
-    hamiltonian : SparsePauliOp
+    hamiltonian : SparsePauliOp,
+    backend: ibm_backend.IBMBackend = None,
+    shots: int = 1024
 ):
     # Bind parameters to the quantum circuit
-    bound_qc = qc_template.assign_parameters(
-        {p: v for p, v in zip(param_list, current_params)},
-        inplace=False
-    )
-    # Simulate the statevector
-    statevector = Statevector.from_instruction(bound_qc)
-    probabilities = statevector.probabilities()
-    # Convert probabilities to counts
-    counts = Counter({
-        format(i, f"0{qc_template.num_qubits}b"): p
-        for i, p in enumerate(probabilities)
-    })
+    if backend is not None:
+        qc_template.measure(range(qc_template.num_qubits), range(qc_template.num_qubits))
+        transpiled_qc = transpile(qc_template, backend=backend)
+        sampler = Sampler(mode=backend)
+        binding = {p: v for p, v in zip(param_list, current_params)}
+        job = sampler.run([(transpiled_qc, binding)], shots=shots)
+        result = job.result()._pub_results[0].data.c
+        counts = result.get_counts()
+        # Convert counts to probabilities
+        total_counts = sum(counts.values())
+        if total_counts == 0:
+            return 0.0
+        probabilities = {k: v / total_counts for k, v in counts.items()}
+        # Convert probabilities to counts
+        counts = Counter({
+            k: v for k, v in probabilities.items()
+        })
+    else:
+        bound_qc = qc_template.assign_parameters(
+            {p: v for p, v in zip(param_list, current_params)},
+            inplace=False
+        )
+        # Simulate the statevector
+        statevector = Statevector.from_instruction(bound_qc)
+        probabilities = statevector.probabilities()
+        # Convert probabilities to counts
+        counts = Counter({
+            format(i, f"0{qc_template.num_qubits}b"): p
+            for i, p in enumerate(probabilities)
+        })
+    
+    
     # Encrypt counts based on the plaintext
     encrypted_counts = encrypt_counts_keys(counts, plaintext)
     # Normalize to get probabilities
@@ -398,11 +374,13 @@ def optimize_vqa_hamiltonian(
     plaintexts: list,
     maxiter: int = 500,
     tol: float = 1e-6,
+    optimizer : str = "COBYLA",
+    backend : ibm_backend.IBMBackend = None
 ):
     
 
-    def objective_function_wrapper(current_params, qc_template, param_list, plaintext, hamiltonian):
-        return default_objective_function(current_params, qc_template, param_list, plaintext, hamiltonian)
+    def objective_function_wrapper(current_params, qc_template, param_list, plaintext, hamiltonian, backend):
+        return default_objective_function(current_params, qc_template, param_list, plaintext, hamiltonian, backend=backend)
             
 
     results = {
@@ -419,7 +397,7 @@ def optimize_vqa_hamiltonian(
         pbar = tqdm(total=maxiter, desc=f"Optimizing pair {k+1}/{len(hamiltonian_list)}", leave=True)
 
         def scipy_objective(current_params):
-            cost = objective_function_wrapper(current_params, qc_template, param_list, plaintext, hamiltonian)
+            cost = objective_function_wrapper(current_params, qc_template, param_list, plaintext, hamiltonian, backend=backend)
             cost_history.append(cost)
             return cost
         
@@ -429,7 +407,7 @@ def optimize_vqa_hamiltonian(
         result = minimize(
             scipy_objective,
             params,
-            method='COBYLA',
+            method=optimizer,
             options={'maxiter': maxiter, 'disp': False},
             callback=callback
         )
@@ -449,10 +427,12 @@ def optimize_vqa_hamming(
     ciphertexts: list,
     maxiter: int = 500,
     tol: float = 1e-6,
+    optimizer: str = "COBYLA",
+    backend: ibm_backend.IBMBackend = None
 ):
-    def objective_function_wrapper(current_params, qc_template, param_list, plaintext, ciphertext):
-        return hamming_distance_objective(current_params, qc_template, param_list, plaintext, ciphertext)
-    
+    def objective_function_wrapper(current_params, qc_template, param_list, plaintext, ciphertext, backend):
+        return hamming_distance_objective(current_params, qc_template, param_list, plaintext, ciphertext, backend=backend)
+
     results = {
         "best_params_per_pair": [],
         "cost_history_per_pair": []
@@ -477,7 +457,7 @@ def optimize_vqa_hamming(
         result = minimize(
             scipy_objective,
             params,
-            method='COBYLA',
+            method=optimizer,
             options={'maxiter': maxiter, 'disp': False},
             callback=callback
         )
@@ -489,7 +469,6 @@ def optimize_vqa_hamming(
 
     return results
     
-
 def optimize_vqa_scipy(
     hamiltonian_list : list[SparsePauliOp],
     qc_template: QuantumCircuit,
@@ -499,7 +478,9 @@ def optimize_vqa_scipy(
     ciphertexts: list,
     maxiter: int = 500,
     tol: float = 1e-6,
-    objective_function : str = "hamiltonian"
+    objective_function : str = "hamiltonian",
+    optimizer: str = "COBYLA",
+    backend: ibm_backend.IBMBackend = None
 ):
     """
     Optimize the parameters of a quantum circuit using SciPy's minimize function.
@@ -519,9 +500,11 @@ def optimize_vqa_scipy(
     """
     
     if objective_function == "hamming":
-        return optimize_vqa_hamming(qc_template, param_list, init_params, plaintexts, ciphertexts, maxiter, tol) 
+        return optimize_vqa_hamming(qc_template, param_list, init_params, plaintexts, ciphertexts, maxiter, tol,
+                                      optimizer=optimizer, backend=backend)
 
-    return optimize_vqa_hamiltonian(hamiltonian_list, qc_template, param_list, init_params, plaintexts, maxiter, tol)
+    return optimize_vqa_hamiltonian(hamiltonian_list, qc_template, param_list, init_params, plaintexts, maxiter, tol,
+                                      optimizer=optimizer, backend=backend)
 
 
 

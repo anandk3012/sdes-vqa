@@ -124,3 +124,79 @@ def sdes_encrypt(plaintext: str, key: str) -> str:
     # Inverse Initial Permutation (IP_INV)
     ciphertext = permute(preoutput, IP_INV)
     return ciphertext
+
+
+
+
+## S-AES Implementation
+
+# 4-bit S-Box and inverse
+SBOX = {
+    0x0: 0x9, 0x1: 0x4, 0x2: 0xA, 0x3: 0xB,
+    0x4: 0xD, 0x5: 0x1, 0x6: 0x8, 0x7: 0x5,
+    0x8: 0x6, 0x9: 0x2, 0xA: 0x0, 0xB: 0x3,
+    0xC: 0xC, 0xD: 0xE, 0xE: 0xF, 0xF: 0x7
+}
+
+SBOX_INV = {v: k for k, v in SBOX.items()}
+
+# GF(2^4) multiplication
+def mul(a, b):
+    p = 0
+    for _ in range(4):
+        if b & 1:
+            p ^= a
+        hi_bit_set = a & 0x8
+        a <<= 1
+        if hi_bit_set:
+            a ^= 0b10011  # x^4 + x + 1 irreducible polynomial
+        b >>= 1
+    return p & 0xF
+
+# SubNib (4-bit substitution)
+def sub_nib(b):
+    return (SBOX[b >> 4] << 4) | SBOX[b & 0xF]
+
+# ShiftRows (swap lower nibbles of 2 bytes)
+def shift_rows(s):
+    return ((s & 0xF000) | (s & 0x0F00) >> 8 |
+            (s & 0x00F0) << 8 | (s & 0x000F))
+
+# MixColumns
+def mix_columns(s):
+    s0 = (s >> 12) & 0xF
+    s1 = (s >> 8) & 0xF
+    s2 = (s >> 4) & 0xF
+    s3 = s & 0xF
+    t0 = mul(1, s0) ^ mul(4, s2)
+    t1 = mul(1, s1) ^ mul(4, s3)
+    t2 = mul(4, s0) ^ mul(1, s2)
+    t3 = mul(4, s1) ^ mul(1, s3)
+    return (t0 << 12) | (t1 << 8) | (t2 << 4) | t3
+
+# Key expansion (produces 3 round keys from 16-bit key)
+def key_expansion(key):
+    RCON1, RCON2 = 0x80, 0x30
+    w = [0] * 6
+    w[0] = (key >> 8) & 0xFF
+    w[1] = key & 0xFF
+    w[2] = w[0] ^ RCON1 ^ sub_nib(w[1])
+    w[3] = w[2] ^ w[1]
+    w[4] = w[2] ^ RCON2 ^ sub_nib(w[3])
+    w[5] = w[4] ^ w[3]
+    return [(w[0] << 8) | w[1], (w[2] << 8) | w[3], (w[4] << 8) | w[5]]
+
+# Encrypt 16-bit plaintext using 16-bit key
+def s_aes_encrypt(plaintext : str, key : str):
+    plaintext = int(plaintext, 2)
+    key = int(key, 2)
+    keys = key_expansion(key)
+    state = plaintext ^ keys[0]
+    state = sub_nib(state >> 8) << 8 | sub_nib(state & 0xFF)
+    state = shift_rows(state)
+    state = mix_columns(state)
+    state ^= keys[1]
+    state = sub_nib(state >> 8) << 8 | sub_nib(state & 0xFF)
+    state = shift_rows(state)
+    ciphertext = state ^ keys[2]
+    return format(ciphertext, "016b")  # Return as 16-bit binary string
